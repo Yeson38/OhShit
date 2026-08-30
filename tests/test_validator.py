@@ -55,13 +55,15 @@ class TestNormalize:
 # ========== B- 判定逻辑 ==========
 
 class TestValidateChallenge:
-    def test_exact_match_is_rejected_anti_copy_paste(self):
+    # --- 新规则（方案A）：精确 = 直接通过（一次过）---
+    def test_exact_match_passes_one_shot_now(self):
         ok, msg = validate_challenge(
             user_input="report_final_v3.docx",
             challenge="report_final_v3.docx",
         )
-        assert ok is False, "完全精确一致必须被拒绝（防复制粘贴）"
-        assert "复制" in msg or "粘贴" in msg or "copy" in msg.lower() or "paste" in msg.lower()
+        assert ok is True, "方案A：一字不差的精确文件名应直接通过（一次过），不再当作粘贴拒绝"
+        assert "通过" in msg or "pass" in msg.lower()
+        assert "精确" in msg or "一字不差" in msg or "exact" in msg.lower()
 
     def test_fuzzy_match_passes_with_shape_substitution(self):
         ok, msg = validate_challenge(
@@ -71,8 +73,8 @@ class TestValidateChallenge:
         assert ok is True
         assert "通过" in msg or "pass" in msg.lower()
 
-    def test_case_insensitive_but_not_exact(self):
-        # 大小写不同 = 字节级不同，不算复制粘贴，应通过
+    def test_case_only_change_still_passes(self):
+        # 只改大小写（与精确不等，但 normalize 同）→ 通过
         ok, _ = validate_challenge(
             user_input="Report_Final_V3.DOCX",
             challenge="report_final_v3.docx",
@@ -86,9 +88,9 @@ class TestValidateChallenge:
         assert any(ch.isdigit() for ch in msg)
 
     def test_leading_trailing_whitespace_stripped_on_input(self):
-        # 用户不小心多加空格也算正确尝试
+        # 用户不小心多加空格，但去除空格后"精确匹配"也该过（一次过）
         ok, _ = validate_challenge(
-            user_input="  Rep0rt_f1nal_v3.docx  \t",
+            user_input="  report_final_v3.docx  \t",
             challenge="report_final_v3.docx",
         )
         assert ok is True
@@ -97,34 +99,88 @@ class TestValidateChallenge:
 # ========== 3 次重试循环 ==========
 
 class TestRunValidationLoop:
-    def test_first_attempt_correct_passes(self, monkeypatch):
+    def test_first_attempt_exact_match_passes_now(self, monkeypatch):
+        """方案A：第一次就精确输对，直接通过（不再因'粘贴嫌疑'扣分）。"""
         from tests.conftest import patch_user_input
-        monkeypatch.setattr('random.choice', lambda seq: seq[0])  # 强制选第一个
-        patch_user_input(monkeypatch, ["Report_Final.DOCX"])   # 与 report_final.docx 大小写不同
+        monkeypatch.setattr('random.choice', lambda seq: seq[0])
+        patch_user_input(monkeypatch, ["report_final.docx"])  # 精确一致
+        # 同时 monkeypatch time.perf_counter 给一个"稍慢但不过分"的 dt (200 ms)，避免触发 paste suspect
+        _t = [0.0]
+        def _fake_perf():
+            _t[0] += 0.2
+            return _t[0]
+        monkeypatch.setattr('time.perf_counter', _fake_perf)
         result, history = run_validation_loop(
             validation_pool=["report_final.docx", "thesis.pdf", "customer.sql"],
             max_attempts=3,
         )
         assert result is True
+        assert history[-1]["passed"] is True
 
-    def test_three_wrong_attempts_fails_with_rotation(self, monkeypatch):
+    def test_fast_input_triggers_paste_suspect_rejected(self, monkeypatch, capsys):
+        """过快（< 120 ms）= 粘贴嫌疑：拒绝并提示'疑似粘贴/毫秒'，但不消耗 3 次 quota。"""
         from tests.conftest import patch_user_input
-        # 强制依次选第0、1、2个，确保三次挑战不同
-        seq_tracker = {'idx': -1}
-        def _force_rotate(seq):
-            seq_tracker['idx'] = (seq_tracker['idx'] + 1) % len(seq)
-            return seq[seq_tracker['idx']]
-        monkeypatch.setattr('random.choice', _force_rotate)
-        patch_user_input(monkeypatch, ["blah1", "blah2", "blah3"])
+        monkeypatch.setattr('random.choice', lambda seq: seq[0])  # 固定同一题
+        # 前 4 次过快（精确 a.txt 本来能过 → 但因 <120ms 被 paste suspect 挡住）
+        # 第 5 次放慢（300ms），同样精确，这次通过
+        patch_user_input(monkeypatch, [
+            "a.txt",  # 1 ms → 快
+            "a.txt",  # 1 ms → 快
+            "a.txt",  # 1 ms → 快
+            "a.txt",  # 1 ms → 快
+            "a.txt",  # 300 ms → 通过
+        ])
+        # 每个"读一次"需要 2 次 perf_counter（start + end），5 次读 = 10 次调用
+        # 前 4 次 dt=1ms；第 5 次 dt=300ms（前后差）
+        timeline = [
+            0.000, 0.001,   # attempt 1 prompt-start, readline-end → dt=1ms
+            0.002, 0.003,   # attempt 2
+            0.004, 0.005,   # attempt 3
+            0.006, 0.007,   # attempt 4
+            0.010, 0.310,   # attempt 5 dt=300ms ≥ 120 → 通过
+        ]
+        _i = [0]
+        def _tick():
+            v = timeline[_i[0]]
+            _i[0] += 1
+            return v
+        monkeypatch.setattr('time.perf_counter', _tick)
         result, history = run_validation_loop(
             validation_pool=["a.txt", "b.txt", "c.txt"],
             max_attempts=3,
         )
-        assert result is False
-        # 历史应记录 3 次挑战，且每次的挑战文件名不同（轮换）
-        assert len(history) == 3
-        challenges_used = [h["challenge"] for h in history]
-        assert len(set(challenges_used)) == 3, "三次失败的挑战文件名必须轮换不同，防止死磕一个"
+        out = capsys.readouterr().out
+        # 文案必须包含"过快/疑似粘贴/毫秒/120"等 paste suspect 关键词
+        assert any(kw in out for kw in ("过快", "粘贴", "毫秒", "ms", "疑似")), f"got: {out[:400]}"
+        # 至少有 4 条 paste_suspect 历史（不占 quota）+ 1 条通过 = 5 条 history
+        paste_count = sum(1 for h in history if h.get("paste_suspect"))
+        assert paste_count >= 4, f"paste_suspect 只有 {paste_count} 条: {history}"
+        assert result is True, f"第 5 次慢速应通过，却失败 history={history[-3:]}"
+
+    def test_paste_suspect_does_not_consume_quota(self, monkeypatch, capsys):
+        """前 3 次过快都不占 quota → 不触发'耗尽 3 次'；再放慢 1 次精确直接通过。"""
+        from tests.conftest import patch_user_input
+        monkeypatch.setattr('random.choice', lambda seq: seq[0])  # 固定题
+        patch_user_input(monkeypatch, [
+            "x.txt",   # 过快 1
+            "x.txt",   # 过快 2
+            "x.txt",   # 过快 3
+            "x.txt",   # 通过（慢）
+        ])
+        timeline = [0.0, 0.001, 0.010, 0.020, 0.030, 0.200, 0.500]
+        _i = [0]
+        def _tick():
+            v = timeline[_i[0]]
+            _i[0] += 1
+            return v
+        monkeypatch.setattr('time.perf_counter', _tick)
+        ok, hist = run_validation_loop(
+            validation_pool=["x.txt"],
+            max_attempts=3,
+        )
+        assert ok is True, f"前 3 次 paste_suspect 不应消耗 quota，第 4 次应该正常通过，hist={hist}"
+        # 确认没出现"耗尽"
+        assert "耗尽" not in capsys.readouterr().out
 
     def test_ctrl_c_exits_gracefully(self, monkeypatch):
         def fake_input_always_raises(*a, **kw):
