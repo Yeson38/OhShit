@@ -64,7 +64,7 @@ Write-Host ""
 Write-Host "Smoke test (target machine NO python / NO pip required):"
 Write-Host "  .\ohshit.exe --version"
 Write-Host ""
-Write-Host "Upload to GitHub Release v1.0.0:" -ForegroundColor Yellow
-Write-Host "  https://github.com/Yeson38/OhShit/releases/tag/v1.0.0 -> Edit"
+Write-Host "Upload to GitHub Release v1.0.1:" -ForegroundColor Yellow
+Write-Host "  https://github.com/Yeson38/OhShit/releases/tag/v1.0.1 -> Edit"
 Write-Host "  Drop ohshit.exe into Attach binaries box, rename -> ohshit-windows-x86_64.exe"
 Write-Host "  Drop SHA256SUMS.win too so users can verify."

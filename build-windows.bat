@@ -61,7 +61,7 @@ ECHO.
 ECHO Smoke test ^(target machine needs NO python^):
 ECHO     dist\ohshit.exe --version
 ECHO.
-ECHO Upload: https://github.com/Yeson38/OhShit/releases/tag/v1.0.0 -^> Edit
+ECHO Upload: https://github.com/Yeson38/OhShit/releases/tag/v1.0.1 -^> Edit
 ECHO         Attach ohshit.exe as ohshit-windows-x86_64.exe
 ECHO         Attach SHA256SUMS.win as SHA256SUMS.windows-x86_64
 POPD

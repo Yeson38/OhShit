@@ -32,7 +32,7 @@ def test_cli_dry_run_rm_without_force_prints_preview_nonzero_code(monkeypatch, t
 def test_cli_version_flag():
     cp = _run(["--version"])
     assert cp.returncode == 0
-    assert "1.0.0" in cp.stdout
+    assert "1.0.1" in cp.stdout
 
 def test_cli_missing_hook_name_returns_2_with_help_hint():
     cp = _run([])
