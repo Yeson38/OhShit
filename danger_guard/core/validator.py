@@ -1,23 +1,38 @@
 """
 B- 随机文件名验证算法（核心防呆）。
-规则（方案A：允许精确一次过，纯时序检测粘贴）：
-1. 忽略大小写（底层统一 lower()）
-2. 形近字模糊容忍：O/0/Q, l/1/I/|, S/5, Z/2, B/8, G/9 等等价
-3. 精确匹配（一字不差）= 直接通过（一次过，不再拒绝）。
-   检测"粘贴"不靠静态文字一致性，靠**动态时序**：
-     3a. 用户从 prompt 出现到完整输入一行的时间 < FAST_THRESHOLD_MS(120 ms)
-         → 判定为"粘贴嫌疑"，提示疑似粘贴并重抽同题（不消耗 3 次 quota）。
-     3b. 若用户非精确匹配（改字或形近）但 3a 触发，仍按"粘贴嫌疑"走重抽同题。
-   （人眼扫题 + 定位键盘 + 敲第一下字符 至少 120~200 ms，< 120 ms 一定是粘贴/历史命令补全。）
-4. 3 次"真实机会"轮换，paste_suspect 不占次数；改字示例每次 prompt 都给一个具体参考。
+规则（方案A：允许精确一次过，3 层粘贴检测 + PS/PowerShell/PSReadLine 兼容）：
+1. 忽略大小写 + 形近字模糊容忍。
+2. 精确匹配（一字不差）= 直接通过（一次过）。
+3. 粘贴检测（按检测优先级）：
+   3a. 逐字符 burst：`inter-char dt < 4ms` 且连续 ≥ 3 个 → 粘贴嫌疑（命中 PSReadLine 注入式粘贴，
+       这类粘贴终端不会发 bracketed marker，也不会被 readline 看到"内容"）。
+   3b. Bracketed Paste marker（`\e[200~…\e[201~`）。
+   3c. 整行耗时 < 120 ms（兜底：老终端 + 非 burst 的小块粘贴）。
+   任一命中 → 判 paste_suspect（不占 3 次 quota，同题重出）。
+   3d. PowerShell/PSReadLine 兜底：如果 keystroke 读到"一行 0 字符"但 Enter 被按了（典型表现：
+       PSReadLine 在粘贴完成后把自己的 prompt + 清理逻辑写回了 conhost，我们读到的是空串），
+       也算粘贴嫌疑"未检测到实际输入"，提示用户手打（不占 quota）。
+4. 平台兼容：
+   - Windows PowerShell：走 msvcrt.getwch() 逐字（keystroke.read_line_timed），绕开
+     PSReadLine 的 readline 拦截；剥 CRLF；SIGINT handler 保证 Ctrl+C 到 rc=130。
+   - POSIX：走 termios raw VMIN=1，逐字带时间戳。
+5. Ctrl+C：3 层捕获（validator → engine → __main__），一律打印"✅ 已取消"返回 rc=130，
+   在 Windows 额外识别 STATUS_CONTROL_C_EXIT(-1073741510) 也转 130。
 """
 import random
 import sys
 import time
+import signal
 from typing import List, Tuple, Dict, Any, Optional
 
-# 过快判定阈值（毫秒）。从 prompt 打完输出 flush → 拿到完整一行 readline 的时间差。
-# 120 ms 是人类"看懂题 + 启动手指 + 输入完一个文件名"的极限下界；粘贴永远 < 1 ms。
+from danger_guard.core.keystroke import (
+    read_line_timed as _read_line_timed,
+    is_burst_paste as _is_burst_paste,
+    paste_reason_burst as _paste_reason_burst,
+    BURST_DT_MS as _BURST_DT_MS,
+    BURST_MIN_RUN as _BURST_MIN_RUN,
+)
+# 整行耗时阈值（毫秒）。从 prompt flush 完成到拿到 Enter 的总耗时。
 FAST_THRESHOLD_MS = 120
 
 # 自定义异常类（Ctrl+C 包装等）
@@ -266,12 +281,6 @@ def run_validation_loop(
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     运行多轮 B- 验证交互，直到通过或耗尽次数。
-    :param validation_pool: 候选文件名/设备名池（必须非空）
-    :param max_attempts: 最大真实尝试次数（默认 3）。"粘贴嫌疑（过快输入或有 Bracketed Paste marker）"不消耗本次 quota。
-    :param challenge_prompt_fn: 可选，自定义 prompt 函数。签名: fn(challenge, attempt, max_attempts) -> None
-    :returns: (是否全部通过, 历史记录列表)
-              历史记录每项为 {"challenge": str, "user_input": str, "passed": bool, "message": str,
-                                 "paste_suspect": bool, "elapsed_ms": int, "cancelled": bool}
     """
     if not validation_pool:
         raise ConfusableError("validation_pool 不能为空，至少需要 1 个候选")
@@ -280,19 +289,29 @@ def run_validation_loop(
     history: List[Dict[str, Any]] = []
     used_this_round: List[str] = []
 
-    # 先输出验证规则的提示语（只打一次）
+    # 安装 SIGINT handler（Windows 也能捕获 signal.SIGINT；重复调用是安全的）。
+    # 目的：conhost 在 Ctrl+C 时可能不按顺序抛 KeyboardInterrupt，
+    # 但 signal handler 会先执行——这里只做"提醒"，真正的退出仍走 KBI 捕获分支。
+    # 多线程/嵌套调用下 signal.signal 返回上一个 handler，不做任何恢复（我们不恢复）。
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)  # 先还原默认（保证抛 KBI）
+    except (ValueError, AttributeError, OSError):
+        pass
+
     print("\n" + _bold_yellow("━" * 52))
     print(_bold_yellow(" 🔐 OhShit B- 人机验证"))
     print(_yellow("    · 精确一字不差的文件名 → 直接通过（一次过）"))
     print(_yellow("    · 允许写错字形（o↔0、l↔1、Z↔2 等互通），允许改大小写"))
-    print(_yellow(f"    · ⚠️ 输入 < {FAST_THRESHOLD_MS} 毫秒视为疑似粘贴（或历史命令补全），"))
-    print(_yellow("      不占用 3 次机会，请放慢节奏，再输一遍同样的（或形近字）。"))
-    print(_yellow("    · ⚠️ 检测到 Bracketed Paste marker（终端 Ctrl+Shift+V 会注入）→ 直接判粘贴嫌疑，"))
-    print(_yellow("      不占次数，手动再打一遍就行。"))
+    print(_yellow(f"    · ⚠️ 粘贴检测（不占 3 次机会）："))
+    print(_yellow(f"        · 逐字爆发（{_BURST_MIN_RUN} 个字符间隔 < {_BURST_DT_MS} ms）"))
+    print(_yellow(f"        · Bracketed Paste marker（ESC[200~…）"))
+    print(_yellow(f"        · 整行耗时 < {FAST_THRESHOLD_MS} ms；"))
+    print(_yellow("    · ⚠️ Windows PowerShell 下若粘贴无效 → 很可能 PSReadLine 拦截了粘贴内容。"))
+    print(_yellow("      OhShit 会自动识别为空输入'疑似粘贴'，请手打即可。"))
     print(_bold_yellow("━" * 52) + "\n")
     sys.stdout.flush()
 
-    attempt = 1  # 真实尝试计数，只有 paste_suspect=False 才递增
+    attempt = 1
     while attempt <= max_attempts:
         remaining = [p for p in pool if p not in used_this_round]
         if not remaining:
@@ -316,19 +335,20 @@ def run_validation_loop(
                     + _bold(example)
                     + _yellow("  （和原题随便选一个都行）")
                 )
-            sys.stdout.flush()
 
-        # timing 从 prompt 刷新前（即已经开始显示"你可以输入了"）就取 t_start。
-        # winpty 这类伪 TTY 有缓冲语义，如果 t_start 取在 flush 之后会"吃"掉 prompt 输出时间，
-        # 导致 elapsed_ms 偏低 → 粘贴漏判。取在 flush 之前（即便没 flush 完）更保守。
+        # timing 从 flush + t_start 之后开始（与方案 2d 一致）
         sys.stdout.flush()
         t_start = time.perf_counter()
 
+        raw_line: str = ""
+        dts_ms: List[int] = []
+        total_ms: Optional[int] = None
+        fell_back_to_stdin: bool = False
         try:
-            user_input = sys.stdin.readline()
+            # 逐字带时间戳读取（Win=msvcrt / POSIX=termios raw）
+            raw_line, dts_ms, total_ms = _read_line_timed(echo=True)
+            fell_back_to_stdin = (not dts_ms and total_ms is None)
         except KeyboardInterrupt:
-            # Ctrl+C：内部处理为"已取消"，不再冒泡抛栈。
-            # 打印友好提示，返回 (False, history)。engine 与 __main__ 还会再兜底防止任何残留堆栈。
             cancel_msg = "✅ 已取消（Ctrl+C）。操作未执行。"
             history.append({
                 "challenge": challenge,
@@ -342,7 +362,7 @@ def run_validation_loop(
             print("\n  " + _green(cancel_msg))
             sys.stdout.flush()
             return False, history
-        except BaseException as be:   # pragma: no cover — 兜底其它中断（SystemExit/自定义信号）
+        except BaseException as be:
             cancel_msg = f"✅ 已取消（{type(be).__name__}）。操作未执行。"
             history.append({
                 "challenge": challenge,
@@ -358,9 +378,35 @@ def run_validation_loop(
             return False, history
 
         t_end = time.perf_counter()
-        elapsed_ms = int((t_end - t_start) * 1000)
+        # 如果 keystroke 回退到 stdin（非 TTY 或失败），用 perf_counter 做整行耗时兜底
+        if total_ms is None:
+            total_ms = int((t_end - t_start) * 1000)
+        elapsed_ms = total_ms
 
-        if user_input == "":
+        # EOF（keystroke 层 EOF 时 raw_line="",dts=[],total=0）
+        if raw_line == "" and (not dts_ms):
+            # 3d. PSReadLine 特殊兜底：逐字 reader 根本没读到字（不是回退 stdin 模式）。
+            # 这种情况最常出现于 PSReadLine 在 conhost 层把我们 getwch() 和 PSReadLine 的
+            # 读取混在一起 → OhShit 这边读空 Enter。
+            if not fell_back_to_stdin:
+                # 没回退 stdin 但仍空 → PSReadLine 粘贴拦截高概率
+                paste_msg = (
+                    "⏱  粘贴嫌疑（PSReadLine / 终端控制台拦截：未读到任何输入字符，只收到 Enter）。\n"
+                    "   不占用 3 次机会，请不要用粘贴，手动打一遍文件名：\n"
+                    f"     · 原题：{challenge!r}\n"
+                    f"     · 改字版参考：{example!r}"
+                )
+                history.append({
+                    "challenge": challenge, "user_input": "<PSReadLine-empty>",
+                    "passed": False, "message": paste_msg,
+                    "paste_suspect": True, "elapsed_ms": elapsed_ms,
+                })
+                print("  " + _red(paste_msg) + "\n")
+                sys.stdout.flush()
+                if challenge in used_this_round:
+                    used_this_round.remove(challenge)
+                continue
+            # 真 EOF（非交互管道）
             history.append({
                 "challenge": challenge, "user_input": "<EOF>",
                 "passed": False, "message": "EOF: 用户中断输入",
@@ -368,42 +414,51 @@ def run_validation_loop(
             })
             break
 
-        raw_line = user_input.rstrip("\n")
+        # Windows CRLF 剥离（PowerShell / cmd 经常在行尾混 \r）
+        raw_line = raw_line.rstrip("\r\n")
 
-        # ---- 动态检测 1：Bracketed Paste marker（优先级高于一切）----
+        # ---- 检测 3a：burst（逐字爆发）----
+        burst_suspect = not fell_back_to_stdin and _is_burst_paste(dts_ms)
+
+        # ---- 检测 3b：Bracketed Paste marker ----
         bp_markers = _has_bracketed_paste_markers(raw_line)
-        # 把 marker 剥离后再做 validate，否则 ESC 字符会让"精确匹配"永远失败
         visible_input = _strip_bracketed_paste_markers(raw_line) if bp_markers else raw_line
-        # 只有 visible_input 非空时才 validate（纯 marker 或空串的直接判粘贴）
+
+        # ---- 检测 3c：整行过快 ----
+        fast_suspect = len(challenge.strip()) > 0 and elapsed_ms < FAST_THRESHOLD_MS
+
+        # PSReadLine 空粘贴兜底的另一形态：visible_input 为空但 raw_line 非空（极少）
+        empty_input_suspect = (len(visible_input.strip()) == 0) and bp_markers
+
+        paste_suspect = burst_suspect or bp_markers or fast_suspect or empty_input_suspect
+        reasons: List[str] = []
+        if burst_suspect:
+            reasons.append(_paste_reason_burst(dts_ms))
+        if bp_markers:
+            reasons.append("Bracketed Paste marker（检测到 Ctrl+Shift+V / 终端粘贴模式序列）")
+        if fast_suspect and not burst_suspect:
+            reasons.append(f"整行过快（{elapsed_ms} ms < {FAST_THRESHOLD_MS} ms）")
+        if empty_input_suspect:
+            reasons.append("粘贴后内容为空（可能是终端 control 字符混入）")
+        paste_reason = "；".join(reasons) if reasons else "疑似粘贴"
+
+        # 在粘贴嫌疑下，先剥离 marker 再看"内容是否正确"，提示用户"你的输入是对的只要手打"
         passed_from_input = False
         msg_from_input = ""
         if visible_input:
             passed_from_input, msg_from_input = validate_challenge(visible_input, challenge)
         else:
             passed_from_input = False
-            msg_from_input = "粘贴内容为空，无法验证。"
-
-        # ---- 动态检测 2：时序过快 ----
-        fast_suspect = len(challenge.strip()) > 0 and elapsed_ms < FAST_THRESHOLD_MS
-
-        paste_suspect = bp_markers or fast_suspect
-        paste_reason = ""
-        if bp_markers and fast_suspect:
-            paste_reason = "Bracketed Paste marker + 过快输入"
-        elif bp_markers:
-            paste_reason = "Bracketed Paste marker（检测到 Ctrl+Shift+V / 终端粘贴模式序列）"
-        else:  # fast_suspect
-            paste_reason = f"过快输入（{elapsed_ms} ms < {FAST_THRESHOLD_MS} ms）"
+            msg_from_input = "输入内容为空，无法验证。" if not raw_line else ""
 
         if paste_suspect:
             paste_msg = (
-                f"⏱  粘贴嫌疑（{paste_reason}）。"
-                f"\n   不占用 3 次机会，请放慢节奏，再手打一遍："
-                f"\n     · 原题：{challenge!r}"
-                f"\n     · 改字版参考：{example!r}"
+                f"⏱  粘贴嫌疑（{paste_reason}）。\n"
+                f"   不占用 3 次机会，请放慢节奏，再手打一遍：\n"
+                f"     · 原题：{challenge!r}\n"
+                f"     · 改字版参考：{example!r}"
             )
-            # 若用户"粘贴但本来内容是对的"，给个额外提示：内容是对的，只是触发了粘贴检测器
-            if passed_from_input:
+            if passed_from_input and visible_input:
                 paste_msg += f"\n   💡 检测到你粘的内容本身是正确的（{visible_input!r}），只要手打一遍就直接过。"
             history.append({
                 "challenge": challenge,
@@ -419,7 +474,7 @@ def run_validation_loop(
                 used_this_round.remove(challenge)
             continue
 
-        # ---- 非粘贴嫌疑，正常消耗一次 quota ----
+        # ---- 非粘贴嫌疑 ----
         passed = passed_from_input
         msg = msg_from_input
         history.append({
@@ -440,7 +495,6 @@ def run_validation_loop(
             sys.stdout.flush()
             attempt += 1
 
-    # 耗尽所有真实机会
     print(_bold_red(f"✘ 已耗尽 {max_attempts} 次验证机会，操作已取消。"))
     print(_red(f"  若您确认操作无误，可在命令前加 {_bold('DANGER_FORCE=1')} 跳过所有验证。"))
     sys.stdout.flush()

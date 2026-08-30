@@ -24,23 +24,47 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     try:
-        return _main_inner(argv)
+        raw_rc = _main_inner(argv)
     except KeyboardInterrupt:
-        # 再兜底：即便 engine 兜底失效（比如 argparse 处理参数期间 Ctrl+C），也不堆栈。
         msg = "\n[ohshit] ✅ 已取消（Ctrl+C）。操作未执行。"
         try:
-            # 尝试打印带颜色的简洁提示，失败就走普通文本
             print(msg, file=sys.stderr)
             sys.stderr.flush()
         except Exception:
             pass
-        return EXIT_SIGINT
+        raw_rc = EXIT_SIGINT
     except SystemExit as se:
-        # 透传 argparse / 主动 sys.exit
-        return int(se.code) if isinstance(se.code, int) else 2
+        raw_rc = int(se.code) if isinstance(se.code, int) else 2
     except Exception as e:   # pragma: no cover —— 最后保险
         print(f"[ohshit] 未预期的错误: {type(e).__name__}: {e}", file=sys.stderr)
-        return 1
+        raw_rc = 1
+    return normalize_exit_code(raw_rc)
+
+
+# Windows 下 conhost 有时把 Ctrl+C 进程退出码写成 NTSTATUS：
+#   STATUS_CONTROL_C_EXIT = 0xC000013A (unsigned 3221225786 / signed -1073741510)
+# 统一翻译成 shell 约定的 SIGINT rc=130(128+2)。
+_NTSTATUS_CONTROL_C_EXIT_CODES = frozenset([
+    -1073741510,            # signed 32-bit
+    3221225786,             # unsigned 32-bit
+    0xC000013A,             # Python 平台可能按无符号 int 上报
+])
+
+
+def normalize_exit_code(rc: int) -> int:
+    if rc in _NTSTATUS_CONTROL_C_EXIT_CODES:
+        return EXIT_SIGINT
+    # Python 在 Windows 偶尔也把负值（signed overflow 超过 int 范围）当大正数返回，
+    # 兜底：按模 2**32 映射一次再看
+    try:
+        if (rc & 0xFFFFFFFF) in _NTSTATUS_CONTROL_C_EXIT_CODES:
+            return EXIT_SIGINT
+    except Exception:
+        pass
+    # 保证 rc 非负（shell 惯例）
+    if rc < 0:
+        return 128 + min(255, -rc) if (-rc) < 256 else 1
+    return rc
 
 
 def _main_inner(argv=None) -> int:
