@@ -154,8 +154,6 @@ def _pipeline_inner(
         pass
     if any_whitelisted and preview.risk_level == 1:
         print(f"[ohshit] 白名单路径，直接放行（risk=1）")
-        # FIX P0 BUG: 白名单 = 跳过 Stage2 红框 + Stage3 B- 验证，但仍必须真正 dispatch 执行用户命令！
-        # 之前这里直接 return 0，导致 rm/dd 完全没跑、用户数据无声丢失（dd 不写盘、rm 不删）。
         exec_result = hook.execute(parsed, dry_run=dry_run)
         _log_execution(command_name, raw_args, preview, exec_result)
         return exec_result.exit_code

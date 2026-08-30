@@ -116,7 +116,7 @@ $HOME/old_backups
 | `DANGER_LOG` | 绝对或相对路径（指向 JSON Lines 日志） | 覆盖默认审计日志位置 `~/.danger.log`。每次成功执行/取消/失败会写一行 JSON（含时间戳、命令、参数、count、size、risk level、exit code、错误消息）。写失败静默，不阻塞主流程。 |
 | `NO_COLOR` | 任意非空字符串（标准环境变量） | 禁用终端 ANSI 彩色输出。用于 CI 日志收集、不支持 ANSI 的终端、`| grep` 管线。 |
 
-### 8. 验证防护（必须看）
+### 8. 防护流程
 
 当你执行高风险命令时，会看到：
 
@@ -128,15 +128,15 @@ $HOME/old_backups
      - 只改大小写（`Report_Final.DOCX` vs `report_final.docx`）
      - 字形混淆（O↔0、l↔1↔I、S↔5、Z↔2、B↔8、G↔9、符号全半角、括号、斜杠/反斜杠…共 27 组等价类）
      - 前后多打空格（自动 strip）
-   - ⚠️ 不扣次数的重试（不计入 3 次配额，会要求「请手打，不要复制粘贴」）：
+   - 粘贴检测（不计入配额，系统会要求手动输入而非粘贴）：
      - 逐字符输入间隔 < 4ms 连续出现 3 次以上（典型粘贴爆发速度）
      - Bracketed Paste Marker：检测到 `\x1b[200~` 或 `\x9b200~` 开头 + `\x1b[201~` 或 `\x9b201~` 结尾（终端原生粘贴协议 7-bit + 8-bit 双编码都拦截）
      - 整行从出现到回车 < 120ms 打完（正常人打字速度 ≫120ms/行）
      - Windows PowerShell PSReadLine：粘贴后 ReadKey 返回空串立即被 `msvcrt.getwch()` 第二轮感知
-   - ❌ 真错误（扣 1 次配额）：字形/字母明显不对，会给你「还差 N 个字符」的编辑距离提示和常见形近字替换参考示例
-4. **验证通过才执行 rm/dd**：执行结果会追加一行 JSON 到 `~/.danger.log`（可审计）
+   - 错误输入（扣 1 次配额）：字形/字母不符时，系统会显示编辑距离与常见形近字参考。
+4. **通过后执行 rm/dd**：执行结果会追加一行 JSON 到 `~/.danger.log`（可审计）
 
-> 注：如果命令目标在白名单目录（`/tmp/*` 等）且 risk_level=1，会直接放行不会出验证框（这些就是临时文件，删了不心疼）。如果 stdin/stdout 任意一个不是 TTY（脚本/cron/CI 管道模式）则自动跳过整个验证层（不阻塞自动化）。
+> 命令目标位于白名单目录（如 `/tmp/*`）且 risk_level=1 时直接放行。stdin/stdout 任一非 TTY（脚本/cron/CI 管道模式）自动跳过验证层，不阻塞自动化流程。
 
 ### 9. 卸载
 
@@ -153,7 +153,7 @@ ohshit-uninstall
 exec bash    # 或 exec zsh  或 exec fish
 ```
 
-> 💡 Fish 用户注意：**`ohshit-uninstall` 一并清理 `~/.config/fish/config.fish` 中的 Fish 原生 alias 段**（与 Bash/Zsh 共用同一套 marker，无需额外动作）。
+Fish shell 用户：`ohshit-uninstall` 会同步清理 `~/.config/fish/config.fish` 中的原生 alias 注入段（与 Bash/Zsh 使用同一 marker 体系）。
 
 #### 方式 B：用 PowerShell `.\danger_guard\scripts\install.ps1` 安装（Windows 一键）
 
@@ -162,7 +162,7 @@ exec bash    # 或 exec zsh  或 exec fish
 & $env:USERPROFILE\.ohshit\bin\ohshit-uninstall.ps1
 ```
 
-脚本会自动完成 6 步：用 `(?ms)` 多行 regex 从 `$PROFILE` 删除 Remove-Item 包装函数段 → `python -m pip uninstall -y danger-guard` → 删除 dang.cmd / ohshit.cmd → 当前会话立即 `Remove-Alias rm,dd` + 恢复 `global:Remove-Item` 到模块原版 → 保留 `.ohshit` 备份目录防误删 → `Start-Job` 延迟自删 uninstaller 本身。完成后提示 ✅（绿色）。
+脚本按顺序执行：从 `$PROFILE` 多行正则移除 Remove-Item 包装函数段 → 执行 `python -m pip uninstall -y danger-guard` → 删除 dang.cmd / ohshit.cmd 包装命令 → 会话级 `Remove-Alias rm,dd` 并恢复原版 `global:Remove-Item` → 保留 `.ohshit` 备份目录防误删 → 延迟自删卸载脚本自身。
 
 #### 方式 C：pip 安装（§3）
 
@@ -180,12 +180,11 @@ sudo rm -f /usr/local/bin/ohshit    # 或你 mv 过去的自定义路径
 
 > 🔒 所有卸载方式都 **默认保留 `~/.ohshit` 下的备份目录与 `~/.danger.log` 审计日志**，避免误伤用户重要备份或审计证据。如确实要彻底清理可手动 `rm -rf ~/.ohshit ~/.danger.log`。
 
-### 10. 自测（开发者）
+### 10. 开发者测试
 
 ```bash
 cd OhShit
-python -m pytest tests/ -q    # 当前 110 passed：107 核心 + 2 iflag/oflag 回归 + 3 Shell 脚本行为测试
+python -m pytest tests/ -q
 ```
 
-> Shell 脚本测试使用「沙箱 HOME + 跳过真实 pip 安装」的策略，可在无网络环境跑通 Linux install.sh 行为断言；Windows install.ps1 采用静态模板 AST 级断言（校验模板文本中一定含 regex 范围删除 / pip uninstall / self-delete / alias 清理 / 绿色成功提示 5 个必要元素）。
 
