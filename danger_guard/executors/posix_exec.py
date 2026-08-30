@@ -92,10 +92,14 @@ def build_dd_command(parsed: Dict) -> List[str]:
     """
     根据 dd Hook 的 parse_args() 结构化结果构建命令行。
     :param parsed: {"if": str, "of": str, "bs": str, "count": str,
-                     "conv": str, "status": str, "extra_flags": List[str]}
+                     "conv": str, "status": str,
+                     "skip": str, "seek": str, "ibs": str, "obs": str,
+                     "iflag": str, "oflag": str,
+                     "extra_flags": List[str]}
     """
     cmd: List[str] = [DD_PATH]
-    for key in ("if", "of", "bs", "count", "conv", "status", "skip", "seek", "ibs", "obs"):
+    for key in ("if", "of", "bs", "count", "conv", "status",
+                "skip", "seek", "ibs", "obs", "iflag", "oflag"):
         val = parsed.get(key, "")
         if val:
             cmd.append(f"{key}={val}")

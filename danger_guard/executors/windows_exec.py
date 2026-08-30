@@ -91,7 +91,8 @@ def _resolve_dd_on_windows() -> str:
 def build_dd_command(parsed: Dict) -> List[str]:
     """与 POSIX 版本 build_dd_command 逻辑相同，但使用 Windows 可执行路径。"""
     cmd = [_resolve_dd_on_windows()]
-    for key in ("if", "of", "bs", "count", "conv", "status", "skip", "seek", "ibs", "obs"):
+    for key in ("if", "of", "bs", "count", "conv", "status",
+                "skip", "seek", "ibs", "obs", "iflag", "oflag"):
         val = parsed.get(key, "")
         if val:
             cmd.append(f"{key}={val}")

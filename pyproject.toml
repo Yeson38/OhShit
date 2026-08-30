@@ -31,7 +31,8 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-ohshit = "danger_guard.cli:main"
+ohshit = "danger_guard.__main__:main"
+dang   = "danger_guard.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/yeson/ohshit"
