@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "danger-guard"
+version = "1.0.0"
+description = "OhShit 删库跑路预防针 - 防止 rm -rf / dd 等高危命令误操作的包装器"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [{name = "YESON"}]
+keywords = ["security", "rm", "delete", "anti-accident", "safeguard"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+ohshit = "danger_guard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yeson/ohshit"
+Repository = "https://github.com/yeson/ohshit"
+
+[tool.setuptools.packages.find]
+include = ["danger_guard*"]
+exclude = ["tests*", "scripts*", "docs*"]
+
+[tool.setuptools.package-data]
+danger_guard = ["scripts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-ra --strict-markers --tb=short"
