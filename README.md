@@ -103,7 +103,7 @@ $HOME/old_backups
 
 | 变量名 | 有效值 | 说明 |
 |---|---|---|
-| `DANGER_FORCE` | `1` / `true` / `yes` / `on`（大小写不敏感，strip 后比较） | 跳过所有三阶防护（红色警告框仍会打印？→**否：连警告框都不打，直接透传给原生命令**）。用于 CI/CD、脚本自动化。等价于 CLI 加 `--force` flag。 |
+| `DANGER_FORCE` | `1` / `true` / `yes` / `on`（大小写不敏感，strip 后比较） | 跳过所有三阶防护与警告框，直接透传给原生命令。用于 CI/CD、脚本自动化。等价于 CLI 加 `--force` flag。 |
 | `DANGER_WHITELIST` | 绝对或相对路径（指向文本文件） | 覆盖默认白名单文件位置 `~/.danger-whitelist`。团队共用一份白名单时设成共享路径即可。 |
 | `DANGER_LOG` | 绝对或相对路径（指向 JSON Lines 日志） | 覆盖默认审计日志位置 `~/.danger.log`。每次成功执行/取消/失败会写一行 JSON（含时间戳、命令、参数、count、size、risk level、exit code、错误消息）。写失败静默，不阻塞主流程。 |
 | `NO_COLOR` | 任意非空字符串（标准环境变量） | 禁用终端 ANSI 彩色输出。用于 CI 日志收集、不支持 ANSI 的终端、`| grep` 管线。 |
