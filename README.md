@@ -9,12 +9,15 @@
 # 从仓库本地安装（推荐开发/试用）
 git clone https://<your-repo>/OhShit.git && cd OhShit
 bash danger_guard/scripts/install.sh
-source ~/.bashrc  # 或 source ~/.zshrc
+source ~/.bashrc           # 或 source ~/.zshrc
+# Fish 用户： source ~/.config/fish/config.fish
 ```
 
 安装后会：
 - 写 `~/.local/bin/dang` 与 `~/.local/bin/ohshit` 两个入口
 - 在 `~/.bashrc` / `~/.zshrc` 里注入 `source ~/.ohshit-aliases.sh`
+- **在 `~/.config/fish/config.fish` 额外注入 Fish 原生 alias（`alias rm 'dang -- rm'`），Fish 开箱即用**
+- 额外生成真·一键卸载可执行：`~/.local/bin/ohshit-uninstall`（自清理 RC + pip 包 + wrappers，运行后自删）
 - `rm` / `dd` 在交互 shell 下变成 `dang -- rm` / `dang -- dd`
 
 ### 2. 安装（Windows / PowerShell）
@@ -23,8 +26,13 @@ source ~/.bashrc  # 或 source ~/.zshrc
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 git clone https://<your-repo>/OhShit.git ; cd OhShit
 .\danger_guard\scripts\install.ps1
-# 之后重新开一个 PowerShell 窗口
+# 之后重新开一个 PowerShell 窗口（加载 Profile 与用户 PATH）
 ```
+
+安装后会：
+- 写 `~\.ohshit\bin\dang.cmd` 和 `ohshit.cmd`，并自动把 `~\.ohshit\bin` 加入用户级 PATH
+- 在 `$PROFILE` 中注入交互友好的 `function global:Remove-Item`（-Recurse -Force 命中根路径才拦截；其余命令直通原生命令）
+- 额外生成一键卸载脚本：`~\.ohshit\bin\ohshit-uninstall.ps1`（用 `(?ms)` regex 清理 Profile 注入段 + pip uninstall + 自删）
 
 ### 3. 方式 2：pip 安装（无需 clone / 无需 root）
 
@@ -132,21 +140,52 @@ $HOME/old_backups
 
 ### 9. 卸载
 
+按你当初的安装方式选对应命令：
+
+#### 方式 A：用 `bash danger_guard/scripts/install.sh` 安装（Linux / macOS / Fish，通用一键）
+
 ```bash
-# 一键删除本地安装 + 注入项（install.sh 创建的路径）
-rm ~/.local/bin/dang ~/.local/bin/ohshit ~/.ohshit-aliases.sh ~/.ohshit -rf 2>/dev/null
-sed -i '/ohshit-aliases/d' ~/.bashrc ~/.zshrc
+# 安装脚本已在 ~/.local/bin 下生成了真·可执行卸载脚本（它会：sed 批量删除 3 个 RC 文件中的 OhShit marker 注入段
+# → rm ~/.ohshit-aliases.sh → pip uninstall -y danger-guard → 删除 dang/ohshit wrapper → 脚本自删）
+ohshit-uninstall
 
-# 若用 pip 安装的方式 2：
-pip uninstall -y danger-guard
-
-# 若用 zipapp 方式 3：
-sudo rm -f /usr/local/bin/ohshit
+# 卸载完若当前终端别名仍生效，按 shell 选一条重启：
+exec bash    # 或 exec zsh  或 exec fish
 ```
+
+> 💡 Fish 用户注意：**`ohshit-uninstall` 一并清理 `~/.config/fish/config.fish` 中的 Fish 原生 alias 段**（与 Bash/Zsh 共用同一套 marker，无需额外动作）。
+
+#### 方式 B：用 PowerShell `.\danger_guard\scripts\install.ps1` 安装（Windows 一键）
+
+```powershell
+# 安装脚本在 ~\.ohshit\bin 下生成了 ohshit-uninstall.ps1
+& $env:USERPROFILE\.ohshit\bin\ohshit-uninstall.ps1
+```
+
+脚本会自动完成 6 步：用 `(?ms)` 多行 regex 从 `$PROFILE` 删除 Remove-Item 包装函数段 → `python -m pip uninstall -y danger-guard` → 删除 dang.cmd / ohshit.cmd → 当前会话立即 `Remove-Alias rm,dd` + 恢复 `global:Remove-Item` 到模块原版 → 保留 `.ohshit` 备份目录防误删 → `Start-Job` 延迟自删 uninstaller 本身。完成后提示 ✅（绿色）。
+
+#### 方式 C：pip 安装（§3）
+
+```bash
+python -m pip uninstall -y danger-guard
+# 若之前手动往 ~/.bashrc 加了 alias，手动再删一下对应行即可
+```
+
+#### 方式 D：zipapp 单文件（§4）
+
+```bash
+# 把放到 PATH 里的 ohshit.pyz 直接删掉就行
+sudo rm -f /usr/local/bin/ohshit    # 或你 mv 过去的自定义路径
+```
+
+> 🔒 所有卸载方式都 **默认保留 `~/.ohshit` 下的备份目录与 `~/.danger.log` 审计日志**，避免误伤用户重要备份或审计证据。如确实要彻底清理可手动 `rm -rf ~/.ohshit ~/.danger.log`。
 
 ### 10. 自测（开发者）
 
 ```bash
 cd OhShit
-python -m pytest tests/ -q   # 全量测试（当前 105 passed）
+python -m pytest tests/ -q    # 当前 110 passed：107 核心 + 2 iflag/oflag 回归 + 3 Shell 脚本行为测试
 ```
+
+> Shell 脚本测试使用「沙箱 HOME + 跳过真实 pip 安装」的策略，可在无网络环境跑通 Linux install.sh 行为断言；Windows install.ps1 采用静态模板 AST 级断言（校验模板文本中一定含 regex 范围删除 / pip uninstall / self-delete / alias 清理 / 绿色成功提示 5 个必要元素）。
+

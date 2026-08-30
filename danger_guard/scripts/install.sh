@@ -96,7 +96,7 @@ if [ -f "${ALIASES_FILE}" ]; then
   log_info "备份已存在的 ${ALIASES_FILE} → ${BACKUP_DIR}"
 fi
 cat > "${ALIASES_FILE}" <<'ALIASES_EOF'
-# OhShit 删库跑路预防针 — shell aliases
+# OhShit 删库跑路预防针 — shell aliases (Bash / Zsh 专用；Fish 用 config.fish 原生段)
 # 由 danger_guard/scripts/install.sh 自动生成。
 
 # 1) 交互 shell 下覆盖 rm/dd 为 dang
@@ -104,9 +104,6 @@ if [[ $- == *i* ]]; then
   alias rm='dang -- rm'
   alias dd='dang -- dd'
 fi
-
-# 2) 提示如何卸载
-alias ohshit-uninstall='dang --version >/dev/null 2>&1 && echo "执行: rm ~/.ohshit-aliases.sh && sed -i '/ohshit-aliases/d' ~/.bashrc ~/.zshrc && rm ~/.local/bin/dang ~/.local/bin/ohshit" || echo "(dang not found)"'
 ALIASES_EOF
 log_ok "已写入 aliases: ${ALIASES_FILE}"
 
@@ -131,9 +128,119 @@ inject_rc() {
 inject_rc "${HOME}/.bashrc"
 inject_rc "${HOME}/.zshrc"
 
+# ---------- Step E: 注入 Fish ~/.config/fish/config.fish（XDG_CONFIG_HOME 兼容）----------
+# 说明：Fish 不认识 bash 的 alias rm='dang -- rm'（=赋值）语法，也不能 source ~/.ohshit-aliases.sh。
+#       必须独立注入一段 Fish 原生 alias（空格分隔语法）。用与 Bash/Zsh 完全一致的 marker 前缀/后缀，
+#       便于 ohshit-uninstall 中 sed 范围删除一条命令同时覆盖 3 个 RC。
+FISH_XDG_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}"
+FISH_CONFIG_DIR="${FISH_XDG_CONFIG}/fish"
+FISH_CONFIG="${FISH_CONFIG_DIR}/config.fish"
+mkdir -p "${FISH_CONFIG_DIR}"
+[ -f "${FISH_CONFIG}" ] || : > "${FISH_CONFIG}"   # 不存在则建空，让 grep / inject 逻辑统一
+
+# 注入内容：status is-interactive 兼容 Fish ≥3.0；fallback 到 test -n "$PS1" 兼容 Fish 2.x
+if grep -q "OhShit 删库跑路预防针" "${FISH_CONFIG}" 2>/dev/null; then
+  log_info "${FISH_CONFIG} 已包含 ohshit Fish 注入，跳过"
+else
+  cp "${FISH_CONFIG}" "${BACKUP_DIR}/config.fish"
+  {
+    echo ""
+    echo "# >>> OhShit 删库跑路预防针 >>>"
+    echo "# 交互 shell 下覆盖 rm/dd 为 dang（Fish 原生语法；不要写 bash 式 alias=value）"
+    echo "if status is-interactive 2>/dev/null; or test -n \"\$PS1\""
+    echo "  alias rm 'dang -- rm'"
+    echo "  alias dd 'dang -- dd'"
+    echo "end"
+    echo "# <<< OhShit 删库跑路预防针 <<<"
+  } >> "${FISH_CONFIG}"
+  log_ok "已注入 Fish RC: ${FISH_CONFIG}"
+fi
+
+# ---------- Step F: 写真实的 ohshit-uninstall 可执行脚本（一键卸载，自删）----------
+UNINSTALL_BIN="${BIN_DIR}/ohshit-uninstall"
+if [ -e "$UNINSTALL_BIN" ]; then
+  mv "$UNINSTALL_BIN" "${BACKUP_DIR}/ohshit-uninstall-$$"
+  log_info "备份旧 uninstaller 到 ${BACKUP_DIR}"
+fi
+cat > "$UNINSTALL_BIN" <<'UNINSTALL_EOF'
+#!/usr/bin/env bash
+# OhShit 一键卸载脚本（由 danger_guard/scripts/install.sh 在安装时生成）。
+# 用法：直接执行 ohshit-uninstall（已在 ~/.local/bin 下）
+# 设计原则：单环节失败不中断（set +e）；RC marker 统一范围删除；保留用户审计日志与备份目录。
+
+set -uo pipefail   # 不使用 set -e：卸载必须「尽力清理」而非「一步失败全停」
+
+# --- 日志函数（TTY 才上色，兼容 CI / pipe 场景）---
+_col()  { if [ -t "${2:-1}" ]; then printf "\033[%sm[ohshit uninstall]\033[0m %s\n" "$1" "$3"; else printf "[ohshit uninstall] %s\n" "$3"; fi; }
+log_ok()   { _col "32" 1 "$*"; }
+log_warn() { _col "33" 2 "$*" >&2; }
+log_info() { _col "36" 1 "$*"; }
+
+MARKER_START='# >>> OhShit 删库跑路预防针 >>>'
+MARKER_END='# <<< OhShit 删库跑路预防针 <<<'
+
+# -------- 1) 统一 sed 范围删除（GNU sed + BSD sed 双兼容：-i.bak 形式均支持）---------
+strip_markers_from_file() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  local ok=0
+  # GNU sed 常用写法
+  sed -i.ohshit-tmpbak "/^${MARKER_START}\$/,/^${MARKER_END}\$/d" "$file" 2>/dev/null && ok=1
+  if [ "$ok" -ne 1 ]; then
+    # BSD sed（macOS）写法：-i ""（空后缀不生成 bak，我们这里仍手动显式兼容）
+    sed -i "" "/^${MARKER_START}\$/,/^${MARKER_END}\$/d" "$file" 2>/dev/null && ok=1
+  fi
+  rm -f "${file}.ohshit-tmpbak" 2>/dev/null   # 清理 GNU sed 临时 bak
+  if [ "$ok" -eq 1 ]; then
+    log_info "已移除 RC 注入段：${file}"
+  else
+    log_warn "无法用 sed 修改 ${file}，请手动删除『${MARKER_START}』到『${MARKER_END}』之间所有行"
+  fi
+}
+
+strip_markers_from_file "${HOME}/.bashrc"
+strip_markers_from_file "${HOME}/.zshrc"
+strip_markers_from_file "${XDG_CONFIG_HOME:-${HOME}/.config}/fish/config.fish"
+
+# -------- 2) 删除 Bash/Zsh 的 aliases 文件 --------
+if [ -f "${HOME}/.ohshit-aliases.sh" ]; then
+  rm -f "${HOME}/.ohshit-aliases.sh"
+  log_info "已删除 ${HOME}/.ohshit-aliases.sh"
+fi
+
+# -------- 3) pip 卸载 danger-guard（报 not installed 直接忽略；--break-system-packages 双写兼容 Debian/Ubuntu）---------
+PY3_BIN="$(command -v python3 || command -v python)"
+if [ -n "$PY3_BIN" ]; then
+  log_info "调用 pip uninstall -y danger-guard（若出现『not installed』属正常，可忽略）..."
+  "$PY3_BIN" -m pip uninstall -y danger-guard --break-system-packages >/dev/null 2>&1 || true
+  "$PY3_BIN" -m pip uninstall -y danger-guard >/dev/null 2>&1 || true
+fi
+
+# -------- 4) 删除 dang / ohshit wrapper --------
+WRAPPER_DIR="${HOME}/.local/bin"
+if rm -f "${WRAPPER_DIR}/dang" "${WRAPPER_DIR}/ohshit"; then
+  log_info "已删除 ${WRAPPER_DIR}/{dang,ohshit}"
+fi
+
+# -------- 5) 审计日志 / 备份目录保留（禁止自动 rm -rf ~/.ohshit 避免误删用户数据）---------
+log_info "保留 ${HOME}/.ohshit 备份目录与审计日志（~/.danger.log 等），如需彻底清理请手动删除。"
+
+# -------- 6) 完成提示 + 自删（rm -f -- "$0" 必须放在最后一行执行路径的末尾）---------
+log_ok "✅ OhShit 卸载完成！若当前终端别名仍生效，请："
+echo "   • Bash:  exec bash   (或新开终端)"
+echo "   • Zsh :  exec zsh    (或新开终端)"
+echo "   • Fish: exec fish    (或新开终端)"
+
+rm -f -- "$0"
+UNINSTALL_EOF
+chmod +x "$UNINSTALL_BIN"
+log_ok "已写入一键卸载脚本：${UNINSTALL_BIN}（直接执行『ohshit-uninstall』即可）"
+
 # ---------- 完成 ----------
-log_ok "✅ 安装完成！执行："
-echo "   1) source ~/.bashrc   (或 zsh: source ~/.zshrc)"
-echo "   2) 验证：dang --list-hooks"
-echo "   3) 体验：dang --dry-run -- rm -rf /tmp/*"
-log_info "卸载方式：删除 ~/.local/bin/dang ~/.local/bin/ohshit ~/.ohshit-aliases.sh，再移除 bashrc/zshrc 末尾注入。"
+log_ok "✅ 安装完成！下一步："
+echo "   1) 加载当前终端（按你用的 shell 选一条）："
+echo "        Bash: source ~/.bashrc        Zsh:  source ~/.zshrc"
+echo "        Fish: source ~/.config/fish/config.fish   (或新开终端)"
+echo "   2) 验证钩子注册： dang --list-hooks"
+echo "   3) 体验干跑模式： dang --dry-run -- rm -rf /tmp/*"
+echo "   4) 完全卸载：    ohshit-uninstall   (自动清理 RC + pip 包，脚本自删)"

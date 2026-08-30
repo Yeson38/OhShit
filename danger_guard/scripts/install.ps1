@@ -127,8 +127,96 @@ if (-not (Get-Content $PROFILE -ErrorAction SilentlyContinue | Select-String "Oh
   Write-Info "Profile 已注入，跳过"
 }
 
+# ---------- Step E: 生成 ohshit-uninstall.ps1 一键卸载脚本 ----------
+$UninstallPath = Join-Path $BinDir "ohshit-uninstall.ps1"
+if (Test-Path $UninstallPath) {
+  Move-Item -Force $UninstallPath (Join-Path $BackupDir "ohshit-uninstall-$(Get-Random).ps1")
+  Write-Info "备份旧 Windows uninstaller → $BackupDir"
+}
+
+$UninstallTemplate = @"
+<#
+.SYNOPSIS
+  OhShit 一键卸载脚本（由 install.ps1 在安装时生成）。
+  执行：& `$env:USERPROFILE\.ohshit\bin\ohshit-uninstall.ps1`
+  设计原则：ErrorActionPreference = Continue（单步失败不中断）；保留备份与审计目录。
+#>
+`$ErrorActionPreference = "Continue"
+
+function Write-Info-Uninstall(`$m)  { Write-Host "[ohshit uninstall] " -ForegroundColor Cyan  -NoNewline; Write-Host `$m }
+function Write-Warn-Uninstall(`$m)  { Write-Host "[ohshit uninstall] " -ForegroundColor Yellow -NoNewline; Write-Warning `$m }
+function Write-Ok-Uninstall(`$m)    { Write-Host "[ohshit uninstall] " -ForegroundColor Green  -NoNewline; Write-Host `$m }
+
+# -------- 1) 用 (?ms) 多行 regex 从 `$PROFILE 删除 OhShit 整段 marker --------
+if (Test-Path `$PROFILE) {
+  try {
+    `$markerPattern = '(?ms)\r?\n?#\s*>>>\s*OhShit 删库跑路预防针\s*>>>[\s\S]*?#\s*<<<\s*OhShit 删库跑路预防针\s*<<<\s*'
+    `$profileRaw = Get-Content -Raw -Encoding UTF8 -LiteralPath `$PROFILE
+    `$profileNew = `$profileRaw -replace `$markerPattern, "`r`n"
+    if (`$profileNew -ne `$profileRaw) {
+      Set-Content -Encoding UTF8 -LiteralPath `$PROFILE -Value `$profileNew -NoNewline
+      Write-Info-Uninstall "已从 `$PROFILE 移除 OhShit Remove-Item 包装函数注入段"
+    } else {
+      Write-Info-Uninstall "`$PROFILE 中未找到 OhShit marker 段（可能之前已被手动清理），跳过"
+    }
+  } catch {
+    Write-Warn-Uninstall "修改 `$PROFILE 失败：`$(`$_.Exception.Message)。请手动删除标记段。"
+  }
+}
+
+# -------- 2) pip 卸载 danger-guard（报 Package not installed 可忽略）---------
+Write-Info-Uninstall "调用 pip uninstall -y danger-guard（如提示 not installed 属正常）..."
+try {
+  python -m pip uninstall -y danger-guard 2>&1 | Select-Object -Last 3
+} catch {
+  Write-Warn-Uninstall "pip uninstall 报错（很可能本来就没 pip 装过 danger-guard）"
+}
+
+# -------- 3) 删除 dang.cmd / ohshit.cmd wrapper --------
+`$LocalBin = Split-Path -Parent `$MyInvocation.MyCommand.Path
+Remove-Item -LiteralPath (Join-Path `$LocalBin "dang.cmd")    -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path `$LocalBin "ohshit.cmd")  -Force -ErrorAction SilentlyContinue
+Write-Info-Uninstall "已删除 `$LocalBin\dang.cmd、ohshit.cmd"
+
+# -------- 4) 当前会话内 alias / 全局函数清理（用户不开新终端也立即解除拦截）---------
+Remove-Item -Path Alias:\rm -Force -ErrorAction SilentlyContinue
+Remove-Item -Path Alias:\dd -Force -ErrorAction SilentlyContinue
+# Profile 加载的 function global:Remove-Item 只在下一次加载 Profile 时消失，此处尽力恢复为 Module Qualified 版本：
+if (Get-Command "Microsoft.PowerShell.Management\Remove-Item" -ErrorAction SilentlyContinue) {
+  function global:Remove-Item {
+    [CmdletBinding(SupportsShouldProcess = `$true)]
+    param(
+      [Parameter(Position = 0, ValueFromRemainingArguments = `$true, ValueFromPipeline = `$true)]
+      [string[]]`$Path,
+      [switch]`$Recurse, [switch]`$Force, [switch]`$Verbose, [switch]`$WhatIf
+    )
+    process { Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters }
+  }
+  Write-Info-Uninstall "当前会话 Remove-Item 已恢复为系统内置版本。"
+} else {
+  Write-Info-Uninstall "当前会话全局 Remove-Item 包装函数仍然有效，新开 PowerShell 后即失效。"
+}
+
+# -------- 5) 审计日志 / 备份保留（不自动删 ~\.ohshit 避免误删用户数据）---------
+Write-Info-Uninstall "保留 `$env:USERPROFILE\.ohshit 备份目录与审计日志（如需彻底清理请手动删除）。"
+
+# -------- 6) 成功提示 + 自删（Start-Job 延迟 300ms 解决句柄占用再 Remove-Item 自身）---------
+Write-Ok-Uninstall "✅ OhShit 卸载完成！新开 PowerShell 会话即完成彻底清理。"
+
+`$SelfPath = `$MyInvocation.MyCommand.Path
+Start-Job -ScriptBlock {
+  param(`$p)
+  Start-Sleep -Milliseconds 400
+  Remove-Item -LiteralPath `$p -Force -ErrorAction SilentlyContinue
+} -ArgumentList `$SelfPath | Out-Null
+"@
+
+$UninstallTemplate | Set-Content -Encoding UTF8 -LiteralPath $UninstallPath
+Write-Ok "已写入一键卸载脚本：$UninstallPath（PowerShell 内执行 & $UninstallPath）"
+
 # ---------- 结束 ----------
 Write-Ok "✅ 安装完成！执行："
 Write-Host "   1) 重新打开一个 PowerShell 窗口（加载 Profile 与 PATH）"
 Write-Host "   2) dang --list-hooks"
 Write-Host "   3) dang --dry-run -- rm -rf C:\temp\*"
+Write-Host "   4) 完全卸载： & $UninstallPath   (自动清理 Profile + pip + wrappers)"
