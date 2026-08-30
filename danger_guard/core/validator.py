@@ -225,6 +225,40 @@ def validate_challenge(user_input: str, challenge: str) -> Tuple[bool, str]:
 
 # ========== 交互循环 ==========
 
+# Bracketed Paste Mode (xterm/Windows Terminal/mintty/iTerm2/Tmux/VTE 通用)
+# 在 readline() 返回的整行里只要出现开头 ESC[200~ 或结尾 ESC[201~ 就判定为粘贴。
+# ESC 同时接受 \x1b(7-bit) 与 \x9b(8-bit C1) 两种编码，防止老终端/直接字节下发。
+_BRACKET_PASTE_OPEN = ("\x1b[200~", "\x9b200~")
+_BRACKET_PASTE_CLOSE = ("\x1b[201~", "\x9b201~")
+
+
+def _has_bracketed_paste_markers(line: str) -> bool:
+    if not line:
+        return False
+    # 99% 场景：开头紧跟 ESC[200~，结尾紧跟 ESC[201~\n
+    stripped_line = line.rstrip("\n").rstrip("\r")
+    if any(stripped_line.startswith(op) for op in _BRACKET_PASTE_OPEN):
+        return True
+    if any(stripped_line.endswith(cl) for cl in _BRACKET_PASTE_CLOSE):
+        return True
+    # 中间夹带（很少见，但只要出现一对中的任一就保守判）
+    if any(op in line for op in _BRACKET_PASTE_OPEN):
+        return True
+    if any(cl in line for cl in _BRACKET_PASTE_CLOSE):
+        return True
+    return False
+
+
+def _strip_bracketed_paste_markers(line: str) -> str:
+    """把 line 中的 bracketed 序列拿掉，得到用户真想输入的内容（仅用于展示：粘贴被拒时显示内容本身，不要打印 ESC 乱码）。"""
+    s = line
+    for op in _BRACKET_PASTE_OPEN:
+        s = s.replace(op, "")
+    for cl in _BRACKET_PASTE_CLOSE:
+        s = s.replace(cl, "")
+    return s.rstrip("\n").rstrip("\r")
+
+
 def run_validation_loop(
     validation_pool: List[str],
     max_attempts: int = 3,
@@ -233,13 +267,11 @@ def run_validation_loop(
     """
     运行多轮 B- 验证交互，直到通过或耗尽次数。
     :param validation_pool: 候选文件名/设备名池（必须非空）
-    :param max_attempts: 最大真实尝试次数（默认 3）。"粘贴嫌疑（过快输入）"不消耗本次 quota。
+    :param max_attempts: 最大真实尝试次数（默认 3）。"粘贴嫌疑（过快输入或有 Bracketed Paste marker）"不消耗本次 quota。
     :param challenge_prompt_fn: 可选，自定义 prompt 函数。签名: fn(challenge, attempt, max_attempts) -> None
-                                 默认会把提示文案写到 stdout。
     :returns: (是否全部通过, 历史记录列表)
               历史记录每项为 {"challenge": str, "user_input": str, "passed": bool, "message": str,
-                                 "paste_suspect": bool, "elapsed_ms": int}
-    :raises KeyboardInterrupt: 用户按 Ctrl+C 时透传（由上层 engine 捕获显示"已取消"）
+                                 "paste_suspect": bool, "elapsed_ms": int, "cancelled": bool}
     """
     if not validation_pool:
         raise ConfusableError("validation_pool 不能为空，至少需要 1 个候选")
@@ -255,24 +287,21 @@ def run_validation_loop(
     print(_yellow("    · 允许写错字形（o↔0、l↔1、Z↔2 等互通），允许改大小写"))
     print(_yellow(f"    · ⚠️ 输入 < {FAST_THRESHOLD_MS} 毫秒视为疑似粘贴（或历史命令补全），"))
     print(_yellow("      不占用 3 次机会，请放慢节奏，再输一遍同样的（或形近字）。"))
+    print(_yellow("    · ⚠️ 检测到 Bracketed Paste marker（终端 Ctrl+Shift+V 会注入）→ 直接判粘贴嫌疑，"))
+    print(_yellow("      不占次数，手动再打一遍就行。"))
     print(_bold_yellow("━" * 52) + "\n")
     sys.stdout.flush()
 
-    # 外层 while 用来"粘贴嫌疑重试"（同题重来，不占 quota）。
     attempt = 1  # 真实尝试计数，只有 paste_suspect=False 才递增
     while attempt <= max_attempts:
-        # 选一个"在本次还没被用过"的文件名（如果都用完了就重置）
         remaining = [p for p in pool if p not in used_this_round]
         if not remaining:
             remaining = pool
             used_this_round.clear()
         challenge = random.choice(remaining)
         used_this_round.append(challenge)
-
-        # 给出一个具体的改字示例（就算用户"精确过"也能看到它，模糊过的人更需要）
         example = _build_change_example(challenge)
 
-        # 出挑战题
         if challenge_prompt_fn:
             challenge_prompt_fn(challenge, attempt, max_attempts)
         else:
@@ -289,19 +318,49 @@ def run_validation_loop(
                 )
             sys.stdout.flush()
 
-        # 读用户输入（Ctrl+C 要透传给上层）。
-        # 从 flush 完成（prompt 已经显示在屏幕上）开始计时，到 readline 返回完整一行。
-        # 这就是"人看题 + 敲"的时间。粘贴会立刻（< 1ms）返回。
+        # timing 从 prompt 刷新前（即已经开始显示"你可以输入了"）就取 t_start。
+        # winpty 这类伪 TTY 有缓冲语义，如果 t_start 取在 flush 之后会"吃"掉 prompt 输出时间，
+        # 导致 elapsed_ms 偏低 → 粘贴漏判。取在 flush 之前（即便没 flush 完）更保守。
+        sys.stdout.flush()
         t_start = time.perf_counter()
+
         try:
             user_input = sys.stdin.readline()
         except KeyboardInterrupt:
-            raise
+            # Ctrl+C：内部处理为"已取消"，不再冒泡抛栈。
+            # 打印友好提示，返回 (False, history)。engine 与 __main__ 还会再兜底防止任何残留堆栈。
+            cancel_msg = "✅ 已取消（Ctrl+C）。操作未执行。"
+            history.append({
+                "challenge": challenge,
+                "user_input": "<Ctrl+C>",
+                "passed": False,
+                "message": cancel_msg,
+                "paste_suspect": False,
+                "elapsed_ms": 0,
+                "cancelled": True,
+            })
+            print("\n  " + _green(cancel_msg))
+            sys.stdout.flush()
+            return False, history
+        except BaseException as be:   # pragma: no cover — 兜底其它中断（SystemExit/自定义信号）
+            cancel_msg = f"✅ 已取消（{type(be).__name__}）。操作未执行。"
+            history.append({
+                "challenge": challenge,
+                "user_input": f"<{type(be).__name__}>",
+                "passed": False,
+                "message": cancel_msg,
+                "paste_suspect": False,
+                "elapsed_ms": 0,
+                "cancelled": True,
+            })
+            print("\n  " + _green(cancel_msg))
+            sys.stdout.flush()
+            return False, history
+
         t_end = time.perf_counter()
         elapsed_ms = int((t_end - t_start) * 1000)
 
         if user_input == "":
-            # EOF（Ctrl+D）
             history.append({
                 "challenge": challenge, "user_input": "<EOF>",
                 "passed": False, "message": "EOF: 用户中断输入",
@@ -310,46 +369,67 @@ def run_validation_loop(
             break
 
         raw_line = user_input.rstrip("\n")
-        passed, msg = validate_challenge(raw_line, challenge)
 
-        # ---- 动态检测：粘贴嫌疑 ----
-        paste_suspect = False
-        if len(challenge.strip()) > 0 and elapsed_ms < FAST_THRESHOLD_MS:
-            paste_suspect = True
+        # ---- 动态检测 1：Bracketed Paste marker（优先级高于一切）----
+        bp_markers = _has_bracketed_paste_markers(raw_line)
+        # 把 marker 剥离后再做 validate，否则 ESC 字符会让"精确匹配"永远失败
+        visible_input = _strip_bracketed_paste_markers(raw_line) if bp_markers else raw_line
+        # 只有 visible_input 非空时才 validate（纯 marker 或空串的直接判粘贴）
+        passed_from_input = False
+        msg_from_input = ""
+        if visible_input:
+            passed_from_input, msg_from_input = validate_challenge(visible_input, challenge)
+        else:
+            passed_from_input = False
+            msg_from_input = "粘贴内容为空，无法验证。"
+
+        # ---- 动态检测 2：时序过快 ----
+        fast_suspect = len(challenge.strip()) > 0 and elapsed_ms < FAST_THRESHOLD_MS
+
+        paste_suspect = bp_markers or fast_suspect
+        paste_reason = ""
+        if bp_markers and fast_suspect:
+            paste_reason = "Bracketed Paste marker + 过快输入"
+        elif bp_markers:
+            paste_reason = "Bracketed Paste marker（检测到 Ctrl+Shift+V / 终端粘贴模式序列）"
+        else:  # fast_suspect
+            paste_reason = f"过快输入（{elapsed_ms} ms < {FAST_THRESHOLD_MS} ms）"
 
         if paste_suspect:
-            # 粘贴嫌疑：① 不占 quota ② 不改变 challenge ③ 给一个明确提示 + 让他再输一次
             paste_msg = (
-                f"⏱  输入耗时 {elapsed_ms} ms（< {FAST_THRESHOLD_MS} ms）→ 疑似粘贴/历史命令补全。"
-                f"\n   不占用 3 次机会，请放慢节奏，再输一遍（精确或改 1 个字符版 {example!r} 都行）。"
+                f"⏱  粘贴嫌疑（{paste_reason}）。"
+                f"\n   不占用 3 次机会，请放慢节奏，再手打一遍："
+                f"\n     · 原题：{challenge!r}"
+                f"\n     · 改字版参考：{example!r}"
             )
+            # 若用户"粘贴但本来内容是对的"，给个额外提示：内容是对的，只是触发了粘贴检测器
+            if passed_from_input:
+                paste_msg += f"\n   💡 检测到你粘的内容本身是正确的（{visible_input!r}），只要手打一遍就直接过。"
             history.append({
                 "challenge": challenge,
-                "user_input": raw_line,
+                "user_input": visible_input if visible_input else raw_line,
                 "passed": False,
                 "message": paste_msg,
                 "paste_suspect": True,
                 "elapsed_ms": elapsed_ms,
             })
-            # 打红提示
             print("  " + _red(paste_msg) + "\n")
             sys.stdout.flush()
-            # 同题再出：把 challenge 从"已用列表"去掉，让下一轮循环重新选到它
             if challenge in used_this_round:
                 used_this_round.remove(challenge)
-            # attempt 不递增（不消耗）
             continue
 
-        # ---- 非 paste_suspect，正常消耗一次 quota ----
+        # ---- 非粘贴嫌疑，正常消耗一次 quota ----
+        passed = passed_from_input
+        msg = msg_from_input
         history.append({
             "challenge": challenge,
-            "user_input": raw_line,
+            "user_input": visible_input,
             "passed": passed,
             "message": msg,
             "paste_suspect": False,
             "elapsed_ms": elapsed_ms,
         })
-        # 输出结果
         prefix = "  "
         if passed:
             print(prefix + _green(msg) + "\n")
@@ -360,7 +440,7 @@ def run_validation_loop(
             sys.stdout.flush()
             attempt += 1
 
-    # 耗尽所有真实机会（paste_suspect 的重抽永远不会把 attempt 耗光，因为它不走这里）
+    # 耗尽所有真实机会
     print(_bold_red(f"✘ 已耗尽 {max_attempts} 次验证机会，操作已取消。"))
     print(_red(f"  若您确认操作无误，可在命令前加 {_bold('DANGER_FORCE=1')} 跳过所有验证。"))
     sys.stdout.flush()

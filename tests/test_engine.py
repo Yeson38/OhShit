@@ -52,6 +52,40 @@ def test_tty_force_override_invokes_validation_and_passes_with_mocked_approval(t
     from danger_guard.core import tty as tty_m
     with mock.patch.object(tty_m, "is_force_overridden", return_value=True), \
          mock.patch.object(tty_m, "should_run_checks", return_value=True):
-        # 实际上仍会进入 7 步，只是会在"force"分支跳过验证（Step 6 force）
         rc = run_pipeline("rm", ["-f", "/tmp/xyzabc_does_not_exist.log"], dry_run=True)
     assert rc == 0
+
+
+def test_ctrl_c_during_validation_returns_rc130_no_stacktrace(tmp_workspace, capsys):
+    """Step 6 验证阶段 Ctrl+C 不得堆栈；engine 应打印红色"✅ 已取消"，返回 rc=130。"""
+    from danger_guard.core.engine import run_pipeline
+    from danger_guard.core import tty as tty_m
+    import danger_guard.core.engine as engine_m
+    def _raise_kbi(*a, **kw):
+        # engine 中调用 run_validation_loop 是 "from validator import run_validation_loop"，
+        # 必须 patch 该 import 后的名字（engine.run_validation_loop），才会真正在 Step 6 触发。
+        raise KeyboardInterrupt()
+    tgt_dir = os.path.join(tmp_workspace, "kbi_target")
+    os.makedirs(tgt_dir, exist_ok=True)
+    with open(os.path.join(tgt_dir, "x.log"), "w") as f:
+        f.write("hi")
+    from danger_guard.core import whitelist as wl
+    with mock.patch.object(tty_m, "is_force_overridden", return_value=False), \
+         mock.patch.object(tty_m, "should_run_checks", return_value=True), \
+         mock.patch.object(wl, "is_whitelisted_path", return_value=False), \
+         mock.patch.object(engine_m, "run_validation_loop", _raise_kbi):
+        rc = run_pipeline("rm", ["-rf", tgt_dir], dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 130, f"Ctrl+C 必须返回 shell 标准 rc=130，实际 {rc}（path={tgt_dir}）"
+    assert any(kw in out for kw in ("已取消", "Ctrl+C", "中断", "取消")), f"out: {out[:500]}"
+    assert "Traceback" not in out
+    assert "KeyboardInterrupt" not in out
+
+
+def test_ctrl_c_on_entry_main_returns_rc130():
+    """顶层 __main__.main 也必须兜底 KBI 不堆栈，返回 rc=130。"""
+    from danger_guard import __main__ as entry
+    with mock.patch.object(entry, "run_pipeline") as rp:
+        rp.side_effect = KeyboardInterrupt()
+        rc = entry.main(["--dry-run", "--", "rm", "-f", "/tmp/x.log"])
+    assert rc == 130, f"entry main 必须把 KBI 转为 rc=130，实际 {rc}"

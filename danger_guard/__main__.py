@@ -3,7 +3,7 @@ import sys
 import argparse
 
 from danger_guard import __version__
-from danger_guard.core.engine import run_pipeline, detect_command
+from danger_guard.core.engine import run_pipeline, detect_command, EXIT_SIGINT
 from danger_guard.hooks import list_hooks, _ensure_loaded, get_hook
 
 
@@ -23,6 +23,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    try:
+        return _main_inner(argv)
+    except KeyboardInterrupt:
+        # 再兜底：即便 engine 兜底失效（比如 argparse 处理参数期间 Ctrl+C），也不堆栈。
+        msg = "\n[ohshit] ✅ 已取消（Ctrl+C）。操作未执行。"
+        try:
+            # 尝试打印带颜色的简洁提示，失败就走普通文本
+            print(msg, file=sys.stderr)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return EXIT_SIGINT
+    except SystemExit as se:
+        # 透传 argparse / 主动 sys.exit
+        return int(se.code) if isinstance(se.code, int) else 2
+    except Exception as e:   # pragma: no cover —— 最后保险
+        print(f"[ohshit] 未预期的错误: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+
+def _main_inner(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     ns = parser.parse_args(argv)

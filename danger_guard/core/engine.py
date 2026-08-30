@@ -13,6 +13,10 @@ from danger_guard import config
 from danger_guard.executors import dispatch_exec
 
 
+# shell 约定：Ctrl+C → 进程收到 SIGINT → returncode = 128 + 2 = 130
+EXIT_SIGINT = 130
+
+
 def detect_command(argv: List[str]) -> Tuple[str, List[str]]:
     """
     从参数中识别命令名和剩余参数。
@@ -83,7 +87,34 @@ def run_pipeline(
     Step 5. 红色警告框 + 预览摘要
     Step 6. B- 验证（force override → 跳过；dry_run → 仍跑验证但不执行）
     Step 7. 执行
+    顶层保证：任何 Ctrl+C / SystemExit 都不打 Traceback，返回对应 rc（SIGINT=130）。
     """
+    try:
+        return _pipeline_inner(command_name, raw_args, dry_run=dry_run, cli_force_flag=cli_force_flag)
+    except KeyboardInterrupt:
+        # 兜底：validator 已经吞了 KBI，但 Step 1~4 或 Step 7 execute 期间也可能被 Ctrl+C。
+        msg = "\n[ohshit] ✅ 已取消（Ctrl+C）。操作未执行。"
+        try:
+            if ui_core.color_supported():
+                # 用 ui 里的颜色（若 color_supported False 直接原样字符串即可）
+                from danger_guard.core.ui import _red, _bold
+                msg = "\n" + _red(_bold("[ohshit] ✅ 已取消（Ctrl+C）。操作未执行。"))
+            print(msg, file=sys.stderr)
+            sys.stderr.flush()
+        except Exception:
+            print(msg, file=sys.stderr)
+        return EXIT_SIGINT
+    except SystemExit as se:
+        # argparse 的 .error() 本身也抛 SystemExit(2)，这里透传 rc
+        return int(se.code) if isinstance(se.code, int) else 2
+
+
+def _pipeline_inner(
+    command_name: str,
+    raw_args: List[str],
+    dry_run: bool,
+    cli_force_flag: bool,
+) -> int:
     # Step 1: hook lookup + parse
     try:
         hook_cls = get_hook(command_name)

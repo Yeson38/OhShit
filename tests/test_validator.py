@@ -117,12 +117,68 @@ class TestRunValidationLoop:
         assert result is True
         assert history[-1]["passed"] is True
 
+    def test_bracketed_paste_markers_are_treated_as_paste_suspect(self, monkeypatch, capsys):
+        """Ctrl+Shift+V 在大多数终端会在粘贴内容前后包裹 \e[200~ ... \e[201~。
+        只要读到 bracketed paste marker，无论 timing 如何都判定为粘贴（不占 quota，不看精确/模糊）。
+        下一次用户去掉 marker 再慢输一遍就能通过。"""
+        from tests.conftest import patch_user_input
+        monkeypatch.setattr('random.choice', lambda seq: seq[0])
+        # 第 1 行是 bracketed paste（\x1b[200~a.txt\x1b[201~）→ 疑似粘贴
+        # 第 2 行慢输入 a.txt → 通过
+        paste_line = "\x1b[200~a.txt\x1b[201~"
+        patch_user_input(monkeypatch, [paste_line, "a.txt"])
+        # timing: 第 1 次 paste dt=500ms(慢)，但仍应判 paste_suspect(因为 marker)；
+        # 第 2 次 dt=200ms(正常)，精确匹配通过。
+        timeline = [0.0, 0.500,   # paste: 慢（但有 marker → 仍判 paste suspect）
+                    0.600, 0.800]  # normal
+        _i = [0]
+        def _tick():
+            v = timeline[_i[0]]
+            _i[0] += 1
+            return v
+        monkeypatch.setattr('time.perf_counter', _tick)
+        ok, hist = run_validation_loop(validation_pool=["a.txt"], max_attempts=3)
+        out = capsys.readouterr().out
+        # 第 1 次一定要标 paste_suspect（因为 bracketed marker）
+        assert hist[0].get("paste_suspect") is True, f"首条未标 paste_suspect: {hist[0]}"
+        # 提示文案包含 "括号粘贴/bracketed/marker/粘贴" 任意一个
+        assert any(kw in out for kw in ("粘贴", "括号", "Bracketed", "bracketed", "marker", "200")), f"out: {out[:400]}"
+        # 最终通过
+        assert ok is True, f"慢输入应通过, hist={hist}"
+        # 仅 1 次真实 quota 消耗（paste_suspect 那次不占）
+        real_quota = sum(1 for h in hist if not h.get("paste_suspect"))
+        assert real_quota == 1
+
+    def test_bracketed_paste_without_closing_marker(self, monkeypatch, capsys):
+        """有些终端（tmux 被打断）粘贴只发了 \e[200~ 没发 201~。出现开头 ESC[200~ 就判。"""
+        from tests.conftest import patch_user_input
+        monkeypatch.setattr('random.choice', lambda seq: seq[0])
+        patch_user_input(monkeypatch, ["\x1b[200~a.txt"])  # 开了头没收尾
+        timeline = [0.0, 0.400,  # 慢 400ms，纯计时不会判
+                    0.500, 0.720] # 第 2 次正常输入
+        # 上面 paste 后还有一次正常通过需要再补
+        _more = ["a.txt"]
+        import io as _io
+        monkeypatch.setattr('sys.stdin', _io.StringIO("\x1b[200~a.txt\na.txt\n"))
+        _i2 = [0]
+        t2 = [0.0, 0.400, 0.500, 0.720]
+        def _tick2():
+            v = t2[_i2[0] % len(t2)]
+            _i2[0] += 1
+            return v
+        monkeypatch.setattr('time.perf_counter', _tick2)
+        ok, hist = run_validation_loop(validation_pool=["a.txt"], max_attempts=3)
+        out = capsys.readouterr().out
+        assert hist[0].get("paste_suspect") is True, f"第一条应有 paste_suspect: {hist[0]}"
+        # 通过
+        assert ok is True, f"第二次正常输入应通过: {hist}"
+        # 提示包含 paste marker 相关字样
+        assert any(kw in out for kw in ("粘贴", "bracketed", "Bracketed", "200", "marker", "ESC"))
+
     def test_fast_input_triggers_paste_suspect_rejected(self, monkeypatch, capsys):
         """过快（< 120 ms）= 粘贴嫌疑：拒绝并提示'疑似粘贴/毫秒'，但不消耗 3 次 quota。"""
         from tests.conftest import patch_user_input
         monkeypatch.setattr('random.choice', lambda seq: seq[0])  # 固定同一题
-        # 前 4 次过快（精确 a.txt 本来能过 → 但因 <120ms 被 paste suspect 挡住）
-        # 第 5 次放慢（300ms），同样精确，这次通过
         patch_user_input(monkeypatch, [
             "a.txt",  # 1 ms → 快
             "a.txt",  # 1 ms → 快
@@ -130,8 +186,6 @@ class TestRunValidationLoop:
             "a.txt",  # 1 ms → 快
             "a.txt",  # 300 ms → 通过
         ])
-        # 每个"读一次"需要 2 次 perf_counter（start + end），5 次读 = 10 次调用
-        # 前 4 次 dt=1ms；第 5 次 dt=300ms（前后差）
         timeline = [
             0.000, 0.001,   # attempt 1 prompt-start, readline-end → dt=1ms
             0.002, 0.003,   # attempt 2
@@ -150,9 +204,7 @@ class TestRunValidationLoop:
             max_attempts=3,
         )
         out = capsys.readouterr().out
-        # 文案必须包含"过快/疑似粘贴/毫秒/120"等 paste suspect 关键词
         assert any(kw in out for kw in ("过快", "粘贴", "毫秒", "ms", "疑似")), f"got: {out[:400]}"
-        # 至少有 4 条 paste_suspect 历史（不占 quota）+ 1 条通过 = 5 条 history
         paste_count = sum(1 for h in history if h.get("paste_suspect"))
         assert paste_count >= 4, f"paste_suspect 只有 {paste_count} 条: {history}"
         assert result is True, f"第 5 次慢速应通过，却失败 history={history[-3:]}"
@@ -179,12 +231,20 @@ class TestRunValidationLoop:
             max_attempts=3,
         )
         assert ok is True, f"前 3 次 paste_suspect 不应消耗 quota，第 4 次应该正常通过，hist={hist}"
-        # 确认没出现"耗尽"
         assert "耗尽" not in capsys.readouterr().out
 
-    def test_ctrl_c_exits_gracefully(self, monkeypatch):
-        def fake_input_always_raises(*a, **kw):
-            raise KeyboardInterrupt()
-        monkeypatch.setattr('sys.stdin.readline', fake_input_always_raises)
-        with pytest.raises(KeyboardInterrupt):
-            run_validation_loop(validation_pool=["a.txt"], max_attempts=3)
+    def test_ctrl_c_exits_gracefully_no_stack(self, monkeypatch, capsys):
+        """Ctrl+C 不再冒泡到外层抛栈；Validator 内部 catch 后返回 False，并标 cancelled=True。"""
+        class _RaiseOnRead:
+            def readline(self):
+                raise KeyboardInterrupt()
+        monkeypatch.setattr('sys.stdin', _RaiseOnRead())
+        # 现在 run_validation_loop 不应 raise，而应返回 (False, history)，history 里有一条 cancelled
+        ok, hist = run_validation_loop(validation_pool=["a.txt"], max_attempts=3)
+        assert ok is False, "Ctrl+C 之后应返回 (False, ...)"
+        assert any(h.get("cancelled") and "Ctrl" in h.get("message","") for h in hist), f"没有 cancelled 记录: {hist}"
+        out = capsys.readouterr().out
+        # 用户侧提示应含 "已取消/Ctrl+C/中断"，但不可有 Traceback / KeyboardInterrupt（由上层 engine/__main__ 捕获）
+        assert any(kw in out for kw in ("已取消", "Ctrl+C", "中断", "取消"))
+        assert "Traceback" not in out
+        assert "KeyboardInterrupt" not in out
