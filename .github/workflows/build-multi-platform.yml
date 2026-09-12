@@ -1,0 +1,144 @@
+name: Build Multi-Platform Binaries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+      - name: Build
+        run: |
+          pyinstaller --clean --noconfirm --name ohshit_linux_x64 --onefile \
+            --collect-submodules danger_guard \
+            --copy-metadata danger-guard \
+            --strip \
+            danger_guard/__main__.py
+          (cd dist && sha256sum ohshit_linux_x64 > SHA256SUMS)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: |
+            dist/ohshit_linux_x64
+            dist/SHA256SUMS
+
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          install: |
+            apt-get update && apt-get install -y python3 python3-pip python3-venv
+            python3 -m pip install --upgrade pip
+            pip3 install pyinstaller
+            pip3 install -e .
+          run: |
+            pyinstaller --clean --noconfirm --name ohshit_linux_arm64 --onefile \
+              --collect-submodules danger_guard \
+              --copy-metadata danger-guard \
+              --strip \
+              danger_guard/__main__.py
+            (cd dist && sha256sum ohshit_linux_arm64 > SHA256SUMS)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: |
+            dist/ohshit_linux_arm64
+            dist/SHA256SUMS
+
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+      - name: Build
+        run: |
+          pyinstaller --clean --noconfirm --name ohshit_windows_x64 --onefile --collect-submodules danger_guard --copy-metadata danger-guard danger_guard/__main__.py
+          cd dist
+          certutil -hashfile ohshit_windows_x64.exe SHA256 > SHA256SUMS.tmp
+          # Convert certutil output to sha256sum format
+          $hash = (Get-FileHash ohshit_windows_x64.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ohshit_windows_x64.exe" | Out-File -Encoding ascii SHA256SUMS
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/ohshit_windows_x64.exe
+            dist/SHA256SUMS
+
+  build-macos-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+      - name: Build
+        run: |
+          pyinstaller --clean --noconfirm --name ohshit_macos_x64 --onefile \
+            --collect-submodules danger_guard \
+            --copy-metadata danger-guard \
+            danger_guard/__main__.py
+          (cd dist && shasum -a 256 ohshit_macos_x64 > SHA256SUMS)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64
+          path: |
+            dist/ohshit_macos_x64
+            dist/SHA256SUMS
+
+  build-macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+      - name: Build
+        run: |
+          pyinstaller --clean --noconfirm --name ohshit_macos_arm64 --onefile \
+            --collect-submodules danger_guard \
+            --copy-metadata danger-guard \
+            danger_guard/__main__.py
+          (cd dist && shasum -a 256 ohshit_macos_arm64 > SHA256SUMS)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: |
+            dist/ohshit_macos_arm64
+            dist/SHA256SUMS
