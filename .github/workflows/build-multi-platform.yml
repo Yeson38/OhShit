@@ -33,26 +33,25 @@ jobs:
             dist/SHA256SUMS
 
   build-linux-arm64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - uses: uraimo/run-on-arch-action@v2
+      - uses: actions/setup-python@v5
         with:
-          arch: aarch64
-          distro: ubuntu22.04
-          githubToken: ${{ github.token }}
-          install: |
-            apt-get update && apt-get install -y python3 python3-pip python3-venv
-            python3 -m pip install --upgrade pip
-            pip3 install pyinstaller
-            pip3 install -e .
-          run: |
-            pyinstaller --clean --noconfirm --name ohshit_linux_arm64 --onefile \
-              --collect-submodules danger_guard \
-              --copy-metadata danger-guard \
-              --strip \
-              danger_guard/__main__.py
-            (cd dist && sha256sum ohshit_linux_arm64 > SHA256SUMS)
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+      - name: Build
+        run: |
+          pyinstaller --clean --noconfirm --name ohshit_linux_arm64 --onefile \
+            --collect-submodules danger_guard \
+            --copy-metadata danger-guard \
+            --strip \
+            danger_guard/__main__.py
+          (cd dist && sha256sum ohshit_linux_arm64 > SHA256SUMS)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -74,13 +73,11 @@ jobs:
           pip install pyinstaller
           pip install -e .
       - name: Build
+        shell: pwsh
         run: |
           pyinstaller --clean --noconfirm --name ohshit_windows_x64 --onefile --collect-submodules danger_guard --copy-metadata danger-guard danger_guard/__main__.py
-          cd dist
-          certutil -hashfile ohshit_windows_x64.exe SHA256 > SHA256SUMS.tmp
-          # Convert certutil output to sha256sum format
-          $hash = (Get-FileHash ohshit_windows_x64.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  ohshit_windows_x64.exe" | Out-File -Encoding ascii SHA256SUMS
+          $hash = (Get-FileHash dist/ohshit_windows_x64.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ohshit_windows_x64.exe" | Out-File -Encoding ascii dist/SHA256SUMS
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
